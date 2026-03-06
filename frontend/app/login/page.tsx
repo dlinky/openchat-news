@@ -18,7 +18,7 @@ export default function LoginPage() {
     setError("");
     try {
       await auth.login(password);
-      router.push("/");
+      router.push("/daily");
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "비밀번호가 올바르지 않습니다");
     } finally {
