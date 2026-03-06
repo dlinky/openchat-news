@@ -40,7 +40,8 @@ async def login(request: LoginRequest, response: Response):
         value=token,
         httponly=True,
         max_age=settings.access_token_expire_minutes * 60,
-        samesite="lax",
+        samesite="none",
+        secure=True,
     )
     return {"message": "로그인 성공"}
 
