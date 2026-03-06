@@ -6,6 +6,7 @@ import json
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select, func
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import AsyncSessionLocal
@@ -50,20 +51,14 @@ async def _ensure_daily_digest(db: AsyncSession, target_date: dt.date) -> None:
         topics = structured.get("topics", [])
         summary_md = json.dumps(structured, ensure_ascii=False)
 
-        existing_ds = await db.execute(
-            select(DailySummary).where(
-                DailySummary.room_id == room.id, DailySummary.date == target_date
+        await db.execute(
+            pg_insert(DailySummary)
+            .values(room_id=room.id, date=target_date, summary_md=summary_md, topics=topics)
+            .on_conflict_do_update(
+                index_elements=["room_id", "date"],
+                set_={"summary_md": summary_md, "topics": topics},
             )
         )
-        ds = existing_ds.scalar_one_or_none()
-        if ds:
-            ds.summary_md = summary_md
-            ds.topics = topics
-        else:
-            db.add(DailySummary(
-                room_id=room.id, date=target_date,
-                summary_md=summary_md, topics=topics,
-            ))
         await db.flush()
         room_summaries.append({"room": room, "structured": structured})
 
@@ -71,7 +66,14 @@ async def _ensure_daily_digest(db: AsyncSession, target_date: dt.date) -> None:
         return
 
     digest_md = await gemini_svc.combine_daily_digest(room_summaries, target_date)
-    db.add(DailyDigest(date=target_date, content_md=digest_md))
+    await db.execute(
+        pg_insert(DailyDigest)
+        .values(date=target_date, content_md=digest_md)
+        .on_conflict_do_update(
+            index_elements=["date"],
+            set_={"content_md": digest_md},
+        )
+    )
     await db.commit()
 
 
@@ -103,10 +105,15 @@ async def _ensure_weekly_digest(db: AsyncSession, year: int, week: int) -> None:
         return
 
     content_md = await gemini_svc.summarize_weekly(dailies, year, week)
-    db.add(WeeklyDigest(
-        year=year, week=week, content_md=content_md,
-        date_from=date_from, date_to=date_to,
-    ))
+    await db.execute(
+        pg_insert(WeeklyDigest)
+        .values(year=year, week=week, content_md=content_md,
+                date_from=date_from, date_to=date_to)
+        .on_conflict_do_update(
+            index_elements=["year", "week"],
+            set_={"content_md": content_md},
+        )
+    )
     await db.commit()
 
 
@@ -207,21 +214,14 @@ async def generate_daily(date_str: str):
                 topics = structured.get("topics", [])
                 summary_md = json.dumps(structured, ensure_ascii=False)
 
-                existing_ds = await db.execute(
-                    select(DailySummary).where(
-                        DailySummary.room_id == room.id,
-                        DailySummary.date == target_date,
+                await db.execute(
+                    pg_insert(DailySummary)
+                    .values(room_id=room.id, date=target_date, summary_md=summary_md, topics=topics)
+                    .on_conflict_do_update(
+                        index_elements=["room_id", "date"],
+                        set_={"summary_md": summary_md, "topics": topics},
                     )
                 )
-                ds = existing_ds.scalar_one_or_none()
-                if ds:
-                    ds.summary_md = summary_md
-                    ds.topics = topics
-                else:
-                    db.add(DailySummary(
-                        room_id=room.id, date=target_date,
-                        summary_md=summary_md, topics=topics,
-                    ))
                 await db.flush()
                 room_summaries.append({"room": room, "structured": structured})
 
@@ -235,14 +235,14 @@ async def generate_daily(date_str: str):
                 room_summaries=room_summaries, target_date=target_date
             )
 
-            existing_digest = await db.execute(
-                select(DailyDigest).where(DailyDigest.date == target_date)
+            await db.execute(
+                pg_insert(DailyDigest)
+                .values(date=target_date, content_md=digest_md)
+                .on_conflict_do_update(
+                    index_elements=["date"],
+                    set_={"content_md": digest_md},
+                )
             )
-            dd = existing_digest.scalar_one_or_none()
-            if dd:
-                dd.content_md = digest_md
-            else:
-                db.add(DailyDigest(date=target_date, content_md=digest_md))
             await db.commit()
 
             yield f"data: {json.dumps({'status': 'done', 'date': date_str}, ensure_ascii=False)}\n\n"
@@ -299,17 +299,15 @@ async def generate_weekly(year_week: str):
 
             content_md = await gemini_svc.summarize_weekly(dailies, year, week)
 
-            existing_wd = await db.execute(
-                select(WeeklyDigest).where(WeeklyDigest.year == year, WeeklyDigest.week == week)
+            await db.execute(
+                pg_insert(WeeklyDigest)
+                .values(year=year, week=week, content_md=content_md,
+                        date_from=date_from, date_to=date_to)
+                .on_conflict_do_update(
+                    index_elements=["year", "week"],
+                    set_={"content_md": content_md},
+                )
             )
-            wd = existing_wd.scalar_one_or_none()
-            if wd:
-                wd.content_md = content_md
-            else:
-                db.add(WeeklyDigest(
-                    year=year, week=week, content_md=content_md,
-                    date_from=date_from, date_to=date_to,
-                ))
             await db.commit()
 
             yield f"data: {json.dumps({'status': 'done'}, ensure_ascii=False)}\n\n"
@@ -384,16 +382,14 @@ async def generate_monthly(year_month: str):
 
             content_md = await gemini_svc.summarize_monthly(weeklies, year, month)
 
-            existing_md = await db.execute(
-                select(MonthlyDigest).where(
-                    MonthlyDigest.year == year, MonthlyDigest.month == month
+            await db.execute(
+                pg_insert(MonthlyDigest)
+                .values(year=year, month=month, content_md=content_md)
+                .on_conflict_do_update(
+                    index_elements=["year", "month"],
+                    set_={"content_md": content_md},
                 )
             )
-            md = existing_md.scalar_one_or_none()
-            if md:
-                md.content_md = content_md
-            else:
-                db.add(MonthlyDigest(year=year, month=month, content_md=content_md))
             await db.commit()
 
             yield f"data: {json.dumps({'status': 'done'}, ensure_ascii=False)}\n\n"
