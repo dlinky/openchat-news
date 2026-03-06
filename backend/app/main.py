@@ -21,7 +21,7 @@ app = FastAPI(title="ChatDigest API", version="0.1.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "https://openchat-news.vercel.app"],
+    allow_origins=["http://localhost:3000", "https://openchat-news.vercel.app", "https://openchat-news.pageme.kr"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
