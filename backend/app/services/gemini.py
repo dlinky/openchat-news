@@ -1,5 +1,7 @@
 """Gemini API 연동 서비스"""
+import asyncio
 import json
+import logging
 import re
 from datetime import date
 from typing import Any
@@ -7,20 +9,31 @@ from google import genai
 from google.genai import types
 from app.config import settings
 
+logger = logging.getLogger(__name__)
+
 _client = genai.Client(api_key=settings.gemini_api_key)
 _MODEL = "gemini-2.5-flash"
 
 
 async def _generate(prompt: str) -> str:
-    """비동기 Gemini 호출"""
-    response = await _client.aio.models.generate_content(
-        model=_MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            thinking_config=types.ThinkingConfig(thinking_budget=0),
-        ),
-    )
-    return response.text
+    """비동기 Gemini 호출 (120초 타임아웃)"""
+    logger.info("Gemini 호출 시작 (프롬프트 %d자)", len(prompt))
+    try:
+        response = await asyncio.wait_for(
+            _client.aio.models.generate_content(
+                model=_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    thinking_config=types.ThinkingConfig(thinking_budget=0),
+                ),
+            ),
+            timeout=120.0,
+        )
+        logger.info("Gemini 호출 완료")
+        return response.text
+    except asyncio.TimeoutError:
+        logger.error("Gemini 호출 타임아웃 (120초 초과, 프롬프트 %d자)", len(prompt))
+        raise Exception("Gemini API 타임아웃")
 
 
 def _extract_json(text: str) -> Any:
