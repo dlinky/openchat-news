@@ -1,4 +1,5 @@
 """요약 생성 라우터 — SSE 스트리밍, 배치 방식"""
+import asyncio
 import calendar
 import datetime as dt
 import json
@@ -7,7 +8,6 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select, func
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import AsyncSessionLocal
 from app.models.models import (
@@ -19,23 +19,15 @@ from app.services import gemini as gemini_svc
 router = APIRouter(prefix="/generate", tags=["generate"])
 
 
-# ─── 배치 헬퍼 ────────────────────────────────────────────────────────────────
+# ─── 채팅방별 하루 분석 ─────────────────────────────────────────────────────────
 
-async def _ensure_daily_digest(db: AsyncSession, target_date: dt.date) -> None:
-    """일간 다이제스트가 없을 때만 생성. 이미 있으면 스킵."""
-    existing = await db.execute(select(DailyDigest).where(DailyDigest.date == target_date))
-    if existing.scalar_one_or_none():
-        return
-
-    rooms_result = await db.execute(select(ChatRoom))
-    rooms = rooms_result.scalars().all()
-    room_summaries = []
-
-    for room in rooms:
+async def _summarize_room(room_id: int, room_name: str, target_date: dt.date) -> dict | None:
+    """채팅방 하루치 분석 + DailySummary upsert (자체 DB 세션)."""
+    async with AsyncSessionLocal() as db:
         msgs_result = await db.execute(
             select(ChatMessage)
             .where(
-                ChatMessage.room_id == room.id,
+                ChatMessage.room_id == room_id,
                 ChatMessage.chat_date == target_date,
                 ChatMessage.message_type == "text",
             )
@@ -43,78 +35,100 @@ async def _ensure_daily_digest(db: AsyncSession, target_date: dt.date) -> None:
         )
         messages = msgs_result.scalars().all()
         if not messages:
-            continue
+            return None
 
         structured = await gemini_svc.summarize_room_daily(
-            room_name=room.name, messages=messages, target_date=target_date
+            room_name=room_name, messages=messages, target_date=target_date
         )
         topics = structured.get("topics", [])
         summary_md = json.dumps(structured, ensure_ascii=False)
 
         await db.execute(
             pg_insert(DailySummary)
-            .values(room_id=room.id, date=target_date, summary_md=summary_md, topics=topics)
+            .values(room_id=room_id, date=target_date, summary_md=summary_md, topics=topics)
             .on_conflict_do_update(
                 index_elements=["room_id", "date"],
                 set_={"summary_md": summary_md, "topics": topics},
             )
         )
-        await db.flush()
-        room_summaries.append({"room": room, "structured": structured})
+        await db.commit()
+        return {"room_name": room_name, "structured": structured}
 
+
+# ─── 배치 헬퍼 ────────────────────────────────────────────────────────────────
+
+async def _ensure_daily_digest(target_date: dt.date) -> None:
+    """일간 다이제스트가 없을 때만 생성. 이미 있으면 스킵. 채팅방 병렬 처리."""
+    async with AsyncSessionLocal() as db:
+        existing = await db.execute(select(DailyDigest).where(DailyDigest.date == target_date))
+        if existing.scalar_one_or_none():
+            return
+        rooms_result = await db.execute(select(ChatRoom))
+        rooms = [(r.id, r.name) for r in rooms_result.scalars().all()]
+
+    results = await asyncio.gather(
+        *[_summarize_room(rid, rname, target_date) for rid, rname in rooms],
+        return_exceptions=True,
+    )
+    room_summaries = [r for r in results if isinstance(r, dict)]
     if not room_summaries:
         return
 
     digest_md = await gemini_svc.combine_daily_digest(room_summaries, target_date)
-    await db.execute(
-        pg_insert(DailyDigest)
-        .values(date=target_date, content_md=digest_md)
-        .on_conflict_do_update(
-            index_elements=["date"],
-            set_={"content_md": digest_md},
+    async with AsyncSessionLocal() as db:
+        await db.execute(
+            pg_insert(DailyDigest)
+            .values(date=target_date, content_md=digest_md)
+            .on_conflict_do_update(
+                index_elements=["date"],
+                set_={"content_md": digest_md},
+            )
         )
-    )
-    await db.commit()
+        await db.commit()
 
 
-async def _ensure_weekly_digest(db: AsyncSession, year: int, week: int) -> None:
-    """주간 다이제스트가 없을 때만 생성 (일간 배치 포함). 이미 있으면 스킵."""
-    existing = await db.execute(
-        select(WeeklyDigest).where(WeeklyDigest.year == year, WeeklyDigest.week == week)
-    )
-    if existing.scalar_one_or_none():
-        return
+async def _ensure_weekly_digest(year: int, week: int) -> None:
+    """주간 다이제스트가 없을 때만 생성 (일간 배치 병렬). 이미 있으면 스킵."""
+    async with AsyncSessionLocal() as db:
+        existing = await db.execute(
+            select(WeeklyDigest).where(WeeklyDigest.year == year, WeeklyDigest.week == week)
+        )
+        if existing.scalar_one_or_none():
+            return
 
     date_from = dt.date.fromisocalendar(year, week, 1)
     date_to = dt.date.fromisocalendar(year, week, 7)
 
-    dates_result = await db.execute(
-        select(ChatMessage.chat_date).distinct()
-        .where(ChatMessage.chat_date >= date_from, ChatMessage.chat_date <= date_to)
-    )
-    for d in sorted(dates_result.scalars().all()):
-        await _ensure_daily_digest(db, d)
-
-    daily_result = await db.execute(
-        select(DailyDigest)
-        .where(DailyDigest.date >= date_from, DailyDigest.date <= date_to)
-        .order_by(DailyDigest.date)
-    )
-    dailies = daily_result.scalars().all()
-    if not dailies:
-        return
-
-    content_md = await gemini_svc.summarize_weekly(dailies, year, week)
-    await db.execute(
-        pg_insert(WeeklyDigest)
-        .values(year=year, week=week, content_md=content_md,
-                date_from=date_from, date_to=date_to)
-        .on_conflict_do_update(
-            index_elements=["year", "week"],
-            set_={"content_md": content_md},
+    async with AsyncSessionLocal() as db:
+        dates_result = await db.execute(
+            select(ChatMessage.chat_date).distinct()
+            .where(ChatMessage.chat_date >= date_from, ChatMessage.chat_date <= date_to)
         )
-    )
-    await db.commit()
+        dates_with_msgs = sorted(dates_result.scalars().all())
+
+    await asyncio.gather(*[_ensure_daily_digest(d) for d in dates_with_msgs])
+
+    async with AsyncSessionLocal() as db:
+        daily_result = await db.execute(
+            select(DailyDigest)
+            .where(DailyDigest.date >= date_from, DailyDigest.date <= date_to)
+            .order_by(DailyDigest.date)
+        )
+        dailies = daily_result.scalars().all()
+        if not dailies:
+            return
+
+        content_md = await gemini_svc.summarize_weekly(dailies, year, week)
+        await db.execute(
+            pg_insert(WeeklyDigest)
+            .values(year=year, week=week, content_md=content_md,
+                    date_from=date_from, date_to=date_to)
+            .on_conflict_do_update(
+                index_elements=["year", "week"],
+                set_={"content_md": content_md},
+            )
+        )
+        await db.commit()
 
 
 # ─── 엔드포인트 ───────────────────────────────────────────────────────────────
@@ -177,7 +191,7 @@ async def get_available():
 
 @router.post("/daily/{date_str}")
 async def generate_daily(date_str: str):
-    """일간 다이제스트 생성 (SSE 스트리밍)"""
+    """일간 다이제스트 생성 (SSE 스트리밍, 채팅방 병렬 처리)"""
     try:
         target_date = dt.date.fromisoformat(date_str)
     except ValueError:
@@ -186,55 +200,28 @@ async def generate_daily(date_str: str):
     async def event_stream():
         async with AsyncSessionLocal() as db:
             rooms_result = await db.execute(select(ChatRoom))
-            rooms = rooms_result.scalars().all()
-            total = len(rooms)
-            room_summaries = []
-            progress = 0
+            rooms = [(r.id, r.name) for r in rooms_result.scalars().all()]
 
-            for room in rooms:
-                msgs_result = await db.execute(
-                    select(ChatMessage)
-                    .where(
-                        ChatMessage.room_id == room.id,
-                        ChatMessage.chat_date == target_date,
-                        ChatMessage.message_type == "text",
-                    )
-                    .order_by(ChatMessage.sent_at)
-                )
-                messages = msgs_result.scalars().all()
-                if not messages:
-                    continue
+        total = len(rooms)
+        yield f"data: {json.dumps({'status': 'processing', 'progress': 0, 'total': total}, ensure_ascii=False)}\n\n"
 
-                progress += 1
-                yield f"data: {json.dumps({'status': 'processing', 'progress': progress, 'total': total}, ensure_ascii=False)}\n\n"
+        results = await asyncio.gather(
+            *[_summarize_room(rid, rname, target_date) for rid, rname in rooms],
+            return_exceptions=True,
+        )
+        room_summaries = [r for r in results if isinstance(r, dict)]
 
-                structured = await gemini_svc.summarize_room_daily(
-                    room_name=room.name, messages=messages, target_date=target_date
-                )
-                topics = structured.get("topics", [])
-                summary_md = json.dumps(structured, ensure_ascii=False)
+        if not room_summaries:
+            yield f"data: {json.dumps({'status': 'error', 'message': '해당 날짜에 메시지가 없습니다'}, ensure_ascii=False)}\n\n"
+            return
 
-                await db.execute(
-                    pg_insert(DailySummary)
-                    .values(room_id=room.id, date=target_date, summary_md=summary_md, topics=topics)
-                    .on_conflict_do_update(
-                        index_elements=["room_id", "date"],
-                        set_={"summary_md": summary_md, "topics": topics},
-                    )
-                )
-                await db.flush()
-                room_summaries.append({"room": room, "structured": structured})
+        yield f"data: {json.dumps({'status': 'combining'}, ensure_ascii=False)}\n\n"
 
-            if not room_summaries:
-                yield f"data: {json.dumps({'status': 'error', 'message': '해당 날짜에 메시지가 없습니다'}, ensure_ascii=False)}\n\n"
-                return
+        digest_md = await gemini_svc.combine_daily_digest(
+            room_summaries=room_summaries, target_date=target_date
+        )
 
-            yield f"data: {json.dumps({'status': 'combining'}, ensure_ascii=False)}\n\n"
-
-            digest_md = await gemini_svc.combine_daily_digest(
-                room_summaries=room_summaries, target_date=target_date
-            )
-
+        async with AsyncSessionLocal() as db:
             await db.execute(
                 pg_insert(DailyDigest)
                 .values(date=target_date, content_md=digest_md)
@@ -245,14 +232,14 @@ async def generate_daily(date_str: str):
             )
             await db.commit()
 
-            yield f"data: {json.dumps({'status': 'done', 'date': date_str}, ensure_ascii=False)}\n\n"
+        yield f"data: {json.dumps({'status': 'done', 'date': date_str}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @router.post("/weekly/{year_week}")
 async def generate_weekly(year_week: str):
-    """주간 다이제스트 생성 (SSE, 일간 배치 포함)"""
+    """주간 다이제스트 생성 (SSE, 일간 배치 병렬)"""
     try:
         year_str, week_str = year_week.split("-W")
         year, week = int(year_str), int(week_str)
@@ -264,7 +251,6 @@ async def generate_weekly(year_week: str):
 
     async def event_stream():
         async with AsyncSessionLocal() as db:
-            # 1. 해당 주 메시지 있는 날짜 조회 (없으면 거부)
             dates_result = await db.execute(
                 select(ChatMessage.chat_date).distinct()
                 .where(ChatMessage.chat_date >= date_from, ChatMessage.chat_date <= date_to)
@@ -275,49 +261,54 @@ async def generate_weekly(year_week: str):
                 yield f"data: {json.dumps({'status': 'error', 'message': '해당 주의 채팅 데이터가 없습니다'}, ensure_ascii=False)}\n\n"
                 return
 
-            # 2. 일간 배치
+            missing_dates = []
             for d in dates_with_msgs:
                 existing_dd = await db.execute(select(DailyDigest).where(DailyDigest.date == d))
-                if existing_dd.scalar_one_or_none():
-                    continue
-                yield f"data: {json.dumps({'status': 'batch_daily', 'date': str(d)}, ensure_ascii=False)}\n\n"
-                await _ensure_daily_digest(db, d)
+                if not existing_dd.scalar_one_or_none():
+                    missing_dates.append(d)
 
-            # 3. 주간 다이제스트 생성
-            yield f"data: {json.dumps({'status': 'combining'}, ensure_ascii=False)}\n\n"
+        for d in missing_dates:
+            yield f"data: {json.dumps({'status': 'batch_daily', 'date': str(d)}, ensure_ascii=False)}\n\n"
+        if missing_dates:
+            await asyncio.gather(*[_ensure_daily_digest(d) for d in missing_dates])
 
+        yield f"data: {json.dumps({'status': 'combining'}, ensure_ascii=False)}\n\n"
+
+        no_dailies = False
+        async with AsyncSessionLocal() as db:
             daily_result = await db.execute(
                 select(DailyDigest)
                 .where(DailyDigest.date >= date_from, DailyDigest.date <= date_to)
                 .order_by(DailyDigest.date)
             )
             dailies = daily_result.scalars().all()
-
             if not dailies:
-                yield f"data: {json.dumps({'status': 'error', 'message': '해당 주의 일간 데이터가 없습니다'}, ensure_ascii=False)}\n\n"
-                return
-
-            content_md = await gemini_svc.summarize_weekly(dailies, year, week)
-
-            await db.execute(
-                pg_insert(WeeklyDigest)
-                .values(year=year, week=week, content_md=content_md,
-                        date_from=date_from, date_to=date_to)
-                .on_conflict_do_update(
-                    index_elements=["year", "week"],
-                    set_={"content_md": content_md},
+                no_dailies = True
+            else:
+                content_md = await gemini_svc.summarize_weekly(dailies, year, week)
+                await db.execute(
+                    pg_insert(WeeklyDigest)
+                    .values(year=year, week=week, content_md=content_md,
+                            date_from=date_from, date_to=date_to)
+                    .on_conflict_do_update(
+                        index_elements=["year", "week"],
+                        set_={"content_md": content_md},
+                    )
                 )
-            )
-            await db.commit()
+                await db.commit()
 
-            yield f"data: {json.dumps({'status': 'done'}, ensure_ascii=False)}\n\n"
+        if no_dailies:
+            yield f"data: {json.dumps({'status': 'error', 'message': '해당 주의 일간 데이터가 없습니다'}, ensure_ascii=False)}\n\n"
+            return
+
+        yield f"data: {json.dumps({'status': 'done'}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @router.post("/monthly/{year_month}")
 async def generate_monthly(year_month: str):
-    """월간 다이제스트 생성 (SSE, 주간/일간 배치 포함)"""
+    """월간 다이제스트 생성 (SSE, 주간/일간 배치 병렬)"""
     try:
         year_str, month_str = year_month.split("-")
         year, month = int(year_str), int(month_str)
@@ -330,7 +321,6 @@ async def generate_monthly(year_month: str):
 
     async def event_stream():
         async with AsyncSessionLocal() as db:
-            # 1. 해당 월에 채팅 데이터가 있는지 확인
             msg_check = await db.execute(
                 select(func.count()).select_from(ChatMessage)
                 .where(ChatMessage.chat_date >= month_start, ChatMessage.chat_date <= period_end)
@@ -339,7 +329,6 @@ async def generate_monthly(year_month: str):
                 yield f"data: {json.dumps({'status': 'error', 'message': '해당 월의 채팅 데이터가 없습니다'}, ensure_ascii=False)}\n\n"
                 return
 
-            # 2. 해당 월에 포함된 주차 산출 (date_from이 월 시작 이후인 주만)
             weeks_in_month: dict[str, tuple[int, int]] = {}
             for offset in range(last_day):
                 d = month_start + dt.timedelta(days=offset)
@@ -350,7 +339,7 @@ async def generate_monthly(year_month: str):
                     if w_date_from >= month_start:
                         weeks_in_month[key] = (iso.year, iso.week)
 
-            # 3. 주간 배치
+            missing_weeks = []
             for key in sorted(weeks_in_month.keys()):
                 w_year, w_week = weeks_in_month[key]
                 existing_wd = await db.execute(
@@ -358,14 +347,18 @@ async def generate_monthly(year_month: str):
                         WeeklyDigest.year == w_year, WeeklyDigest.week == w_week
                     )
                 )
-                if existing_wd.scalar_one_or_none():
-                    continue
-                yield f"data: {json.dumps({'status': 'batch_weekly', 'week': key}, ensure_ascii=False)}\n\n"
-                await _ensure_weekly_digest(db, w_year, w_week)
+                if not existing_wd.scalar_one_or_none():
+                    missing_weeks.append((key, w_year, w_week))
 
-            # 4. 월간 다이제스트 생성
-            yield f"data: {json.dumps({'status': 'combining'}, ensure_ascii=False)}\n\n"
+        for key, _, _ in missing_weeks:
+            yield f"data: {json.dumps({'status': 'batch_weekly', 'week': key}, ensure_ascii=False)}\n\n"
+        if missing_weeks:
+            await asyncio.gather(*[_ensure_weekly_digest(wy, ww) for _, wy, ww in missing_weeks])
 
+        yield f"data: {json.dumps({'status': 'combining'}, ensure_ascii=False)}\n\n"
+
+        no_weeklies = False
+        async with AsyncSessionLocal() as db:
             weekly_result = await db.execute(
                 select(WeeklyDigest)
                 .where(
@@ -375,23 +368,24 @@ async def generate_monthly(year_month: str):
                 .order_by(WeeklyDigest.week)
             )
             weeklies = weekly_result.scalars().all()
-
             if not weeklies:
-                yield f"data: {json.dumps({'status': 'error', 'message': '해당 월의 주간 데이터가 없습니다'}, ensure_ascii=False)}\n\n"
-                return
-
-            content_md = await gemini_svc.summarize_monthly(weeklies, year, month)
-
-            await db.execute(
-                pg_insert(MonthlyDigest)
-                .values(year=year, month=month, content_md=content_md)
-                .on_conflict_do_update(
-                    index_elements=["year", "month"],
-                    set_={"content_md": content_md},
+                no_weeklies = True
+            else:
+                content_md = await gemini_svc.summarize_monthly(weeklies, year, month)
+                await db.execute(
+                    pg_insert(MonthlyDigest)
+                    .values(year=year, month=month, content_md=content_md)
+                    .on_conflict_do_update(
+                        index_elements=["year", "month"],
+                        set_={"content_md": content_md},
+                    )
                 )
-            )
-            await db.commit()
+                await db.commit()
 
-            yield f"data: {json.dumps({'status': 'done'}, ensure_ascii=False)}\n\n"
+        if no_weeklies:
+            yield f"data: {json.dumps({'status': 'error', 'message': '해당 월의 주간 데이터가 없습니다'}, ensure_ascii=False)}\n\n"
+            return
+
+        yield f"data: {json.dumps({'status': 'done'}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")

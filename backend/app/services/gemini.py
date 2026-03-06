@@ -13,27 +13,29 @@ logger = logging.getLogger(__name__)
 
 _client = genai.Client(api_key=settings.gemini_api_key)
 _MODEL = "gemini-2.5-flash"
+_sem = asyncio.Semaphore(30)  # 최대 동시 Gemini 호출 수
 
 
 async def _generate(prompt: str) -> str:
-    """비동기 Gemini 호출 (120초 타임아웃)"""
-    logger.info("Gemini 호출 시작 (프롬프트 %d자)", len(prompt))
-    try:
-        response = await asyncio.wait_for(
-            _client.aio.models.generate_content(
-                model=_MODEL,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    thinking_config=types.ThinkingConfig(thinking_budget=0),
+    """비동기 Gemini 호출 (120초 타임아웃, 동시 호출 세마포어)"""
+    async with _sem:
+        logger.info("Gemini 호출 시작 (프롬프트 %d자)", len(prompt))
+        try:
+            response = await asyncio.wait_for(
+                _client.aio.models.generate_content(
+                    model=_MODEL,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        thinking_config=types.ThinkingConfig(thinking_budget=0),
+                    ),
                 ),
-            ),
-            timeout=120.0,
-        )
-        logger.info("Gemini 호출 완료")
-        return response.text
-    except asyncio.TimeoutError:
-        logger.error("Gemini 호출 타임아웃 (120초 초과, 프롬프트 %d자)", len(prompt))
-        raise Exception("Gemini API 타임아웃")
+                timeout=120.0,
+            )
+            logger.info("Gemini 호출 완료")
+            return response.text
+        except asyncio.TimeoutError:
+            logger.error("Gemini 호출 타임아웃 (120초 초과, 프롬프트 %d자)", len(prompt))
+            raise Exception("Gemini API 타임아웃")
 
 
 def _extract_json(text: str) -> Any:
@@ -104,7 +106,7 @@ async def combine_daily_digest(room_summaries: list[dict], target_date: date) ->
     # 토픽별로 포인트 집계
     topic_map: dict[str, list[dict]] = {}
     for rs in room_summaries:
-        room_name = rs["room"].name
+        room_name = rs["room_name"]
         structured = rs["structured"]  # {"topics": [...], "points": [...]}
         for point in structured.get("points", []):
             topic = point.get("topic", "기타")
